@@ -9,21 +9,72 @@
 <body>
   <canvas id="gameCanvas"></canvas>
 
-  <div id="modeBtn" class="mode-btn place" title="点击切换模式">
+  <!-- 左下角：模式切换按钮 -->
+  <div id="modeBtn" class="mode-btn place hidden" title="点击切换模式">
     <span class="icon">+</span>
     <span class="label">放置模式</span>
   </div>
 
-  <div id="toggleBtn" class="toggle-btn water" title="点击切换方块类型">
+  <!-- 右下角：方块选择按钮（点击打开背包栏） -->
+  <div id="toggleBtn" class="toggle-btn water hidden" title="点击选择方块">
     <span class="icon"></span>
     <span class="label">水</span>
   </div>
 
-  <div id="tooltip">
+  <!-- 背包栏面板 -->
+  <div id="inventoryPanel" class="inventory-panel hidden">
+    <div class="inventory-title">选择方块</div>
+    <div class="inventory-grid" id="inventoryGrid"></div>
+  </div>
+
+  <!-- 右上角：创建房间按钮 -->
+  <div id="createRoomBtn" class="create-room-btn hidden" title="创建联机房间">创建房间</div>
+
+  <!-- 右上角：房间信息 -->
+  <div id="roomInfo" class="room-info hidden">
+    <div class="room-code">房间码：<span id="roomCodeText"></span></div>
+    <div class="room-status" id="roomStatusText"></div>
+  </div>
+
+  <!-- 鼠标提示 -->
+  <div id="tooltip" class="tooltip">
     <div class="tooltip-name"></div>
     <div class="tooltip-desc"></div>
   </div>
 
+  <!-- 登录界面 -->
+  <div id="loginOverlay" class="overlay">
+    <div class="overlay-box">
+      <h1 class="overlay-title">像素沙盒</h1>
+      <p class="overlay-subtitle">输入昵称，创建临时账号</p>
+      <input type="text" id="nicknameInput" class="text-input" placeholder="你的昵称" maxlength="12" autocomplete="off">
+      <button id="loginConfirmBtn" class="menu-btn primary">确认进入</button>
+    </div>
+  </div>
+
+  <!-- 主菜单 -->
+  <div id="menuOverlay" class="overlay hidden">
+    <div class="overlay-box">
+      <h1 class="overlay-title">主菜单</h1>
+      <p class="overlay-subtitle">你好，<span id="menuNickname"></span></p>
+      <button id="startGameBtn" class="menu-btn primary">开始游戏</button>
+      <button id="joinRoomMenuBtn" class="menu-btn">进入房间</button>
+    </div>
+  </div>
+
+  <!-- 加入房间界面 -->
+  <div id="joinRoomOverlay" class="overlay hidden">
+    <div class="overlay-box">
+      <h1 class="overlay-title">进入房间</h1>
+      <p class="overlay-subtitle">输入房间码（格式 XXXXX-XX）</p>
+      <input type="text" id="roomCodeInput" class="text-input" placeholder="ABCDE-12" maxlength="8" autocomplete="off">
+      <p id="joinError" class="error-msg hidden"></p>
+      <button id="joinConfirmBtn" class="menu-btn primary">加入</button>
+      <button id="joinCancelBtn" class="menu-btn">返回</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <script src="game.js"></script>
 </body>
 </html>
