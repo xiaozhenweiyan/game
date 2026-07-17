@@ -9,9 +9,19 @@
 <body>
   <canvas id="gameCanvas"></canvas>
 
+  <div id="modeBtn" class="mode-btn place" title="点击切换模式">
+    <span class="icon">+</span>
+    <span class="label">放置模式</span>
+  </div>
+
   <div id="toggleBtn" class="toggle-btn water" title="点击切换方块类型">
     <span class="icon"></span>
     <span class="label">水</span>
+  </div>
+
+  <div id="tooltip">
+    <div class="tooltip-name"></div>
+    <div class="tooltip-desc"></div>
   </div>
 
   <script src="game.js"></script>
