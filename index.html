@@ -9,6 +9,22 @@
 <body>
   <canvas id="gameCanvas"></canvas>
 
+  <!-- 左上角：聊天按钮 -->
+  <div id="chatBtn" class="chat-btn hidden" title="打开聊天 (T)">
+    <span class="chat-label">聊天</span>
+    <span id="chatDot" class="chat-dot hidden"></span>
+  </div>
+
+  <!-- 左上角：聊天面板 -->
+  <div id="chatPanel" class="chat-panel hidden">
+    <div class="chat-title">联机聊天</div>
+    <div id="chatMessages" class="chat-messages"></div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" class="chat-input" placeholder="输入消息后回车发送..." maxlength="200" autocomplete="off">
+      <button id="chatSendBtn" class="chat-send">发送</button>
+    </div>
+  </div>
+
   <!-- 左下角：模式切换按钮 -->
   <div id="modeBtn" class="mode-btn place hidden" title="点击切换模式">
     <span class="icon">+</span>

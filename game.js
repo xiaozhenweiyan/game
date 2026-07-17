@@ -27,6 +27,14 @@ const joinConfirmBtn = document.getElementById('joinConfirmBtn');
 const joinCancelBtn = document.getElementById('joinCancelBtn');
 const joinError = document.getElementById('joinError');
 
+// 聊天 UI
+const chatBtn = document.getElementById('chatBtn');
+const chatDot = document.getElementById('chatDot');
+const chatPanel = document.getElementById('chatPanel');
+const chatInput = document.getElementById('chatInput');
+const chatMessages = document.getElementById('chatMessages');
+const chatSendBtn = document.getElementById('chatSendBtn');
+
 // ===================== 方块定义 =====================
 const CELL_SIZE = 12;
 const EMPTY = 0;
@@ -70,6 +78,7 @@ let rows = 0;
 let grid = [];
 let seedTimers = [];
 let fireTimers = [];
+let fireOriginGrid = null; // 记录火方块的原方块类型（EMPTY/WOOD/LEAVES），用于决定烧完结果
 let movedGrid = null;   // 复用：每帧只 clear，不重建
 let stillGrid = null;   // 静止水标记（1=静止，跳过移动计算）
 let currentType = WATER;
@@ -78,6 +87,10 @@ let isDeleteMode = false;
 let gameState = 'login'; // login | menu | join | game
 
 const MAX_WATER_PER_FRAME = 2000;
+
+// 聊天状态
+let chatOpen = false;
+let unreadCount = 0;
 
 // ===================== 联机状态 =====================
 const NICKNAME_KEY = 'psx_nickname';
@@ -88,6 +101,7 @@ let conn = null;
 let isHost = false;
 let roomCode = null;
 let multiplayerEnabled = false;
+let lastWorldSync = 0; // 房主上次广播完整世界的时间戳
 
 // ===================== 网格工具 =====================
 function resize() {
@@ -100,12 +114,14 @@ function resize() {
   const newGrid = createGrid(newCols, newRows);
   const newSeedTimers = createSeedTimers(newCols, newRows);
   const newFireTimers = createFireTimers(newCols, newRows);
+  const newFireOrigin = createFireTimers(newCols, newRows);
 
   for (let y = 0; y < Math.min(rows, newRows); y++) {
     for (let x = 0; x < Math.min(cols, newCols); x++) {
       newGrid[y][x] = grid[y][x];
       newSeedTimers[y][x] = seedTimers[y]?.[x] || 0;
       newFireTimers[y][x] = fireTimers[y]?.[x] || 0;
+      newFireOrigin[y][x] = fireOriginGrid ? (fireOriginGrid[y]?.[x] || 0) : 0;
     }
   }
 
@@ -114,6 +130,7 @@ function resize() {
   grid = newGrid;
   seedTimers = newSeedTimers;
   fireTimers = newFireTimers;
+  fireOriginGrid = newFireOrigin;
   // 尺寸变化时让辅助网格按需重建（静止标记失效，水会重新稳定）
   movedGrid = null;
   stillGrid = null;
@@ -199,7 +216,10 @@ function placeBlock(x, y) {
   if (grid[y][x] === EMPTY) {
     grid[y][x] = currentType;
     if (currentType === SEED) seedTimers[y][x] = Date.now();
-    else if (currentType === FIRE) fireTimers[y][x] = Date.now();
+    else if (currentType === FIRE) {
+      fireTimers[y][x] = Date.now();
+      if (fireOriginGrid) fireOriginGrid[y][x] = EMPTY; // 用户放置的火，原方块为空
+    }
     ensureAuxGrids();
     activateAround(x, y);
     if (multiplayerEnabled) sendNet({ type: 'place', x, y, blockType: currentType });
@@ -211,6 +231,7 @@ function deleteBlock(x, y) {
   grid[y][x] = EMPTY;
   seedTimers[y][x] = 0;
   fireTimers[y][x] = 0;
+  if (fireOriginGrid) fireOriginGrid[y][x] = 0;
   ensureAuxGrids();
   activateAround(x, y);
   if (multiplayerEnabled) sendNet({ type: 'delete', x, y });
@@ -264,32 +285,58 @@ function updateWater() {
       const belowBlocked = below !== null && isWaterOrSolid(below);
       const belowSupported = belowBlocked || below === null; // 画布底部视为有支撑
 
+      // 检查左右各 3 格内是否有空位（用于判定是否可水平流动 / 是否可标记静止）
+      let leftHasSpace = false;
+      let rightHasSpace = false;
+      for (let r = 1; r <= 3; r++) {
+        if (isInside(x - r, y) && row[x - r] === EMPTY) leftHasSpace = true;
+        if (isInside(x + r, y) && row[x + r] === EMPTY) rightHasSpace = true;
+      }
+
       if (!belowSupported) {
+        // 下方为空：向下掉落
         grid[y + 1][x] = WATER;
         row[x] = EMPTY;
         newX = x; newY = y + 1;
         movedGrid[y + 1][x] = 1;
         movedThisFrame = true;
       } else if (leftSolid && rightSolid) {
+        // 两侧均为固体：完全无法移动
         movedThisFrame = false;
-      } else if (belowSupported && leftBlocked && rightBlocked && (above === null || above === EMPTY)) {
+      } else if (leftBlocked && rightBlocked && (above === null || above === EMPTY)) {
+        // 两侧被阻挡且上方为空：无法移动
+        movedThisFrame = false;
+      } else if (!leftHasSpace && !rightHasSpace) {
+        // 左右各 3 格内均无空位：无水平流动空间，趋于静止
         movedThisFrame = false;
       } else {
-        const dir = Math.random() < 0.5 ? -1 : 1;
+        // 确定性方向选择：优先空位多的一侧；两侧都有空位则用位置哈希
+        // 哈希基于位置 + 500ms 时间桶，保证同一位置短时间内方向一致，不每帧切换
+        let dir;
+        if (leftHasSpace && !rightHasSpace) dir = -1;
+        else if (!leftHasSpace && rightHasSpace) dir = 1;
+        else dir = (((x * 31 + y * 17 + Math.floor(Date.now() / 500)) % 2) === 0) ? -1 : 1;
+
         const sides = [dir, -dir];
 
+        // 1. 先尝试对角线向下移动
+        //    关键防穿缝：仅当侧方 (x+dx, y) 为空或水时才允许，避免穿过固体方块间的缝隙
         for (const dx of sides) {
           if (isInside(x + dx, y + 1) && grid[y + 1][x + dx] === EMPTY) {
-            grid[y + 1][x + dx] = WATER;
-            row[x] = EMPTY;
-            newX = x + dx; newY = y + 1;
-            movedGrid[y + 1][x + dx] = 1;
-            movedThisFrame = true;
-            break;
+            const sideType = isInside(x + dx, y) ? row[x + dx] : EMPTY;
+            if (sideType === EMPTY || sideType === WATER) {
+              grid[y + 1][x + dx] = WATER;
+              row[x] = EMPTY;
+              newX = x + dx; newY = y + 1;
+              movedGrid[y + 1][x + dx] = 1;
+              movedThisFrame = true;
+              break;
+            }
           }
         }
 
-        if (!movedThisFrame && !(leftBlocked && rightBlocked)) {
+        // 2. 再尝试纯水平移动
+        if (!movedThisFrame) {
           for (const dx of sides) {
             if (isInside(x + dx, y) && row[x + dx] === EMPTY) {
               row[x + dx] = WATER;
@@ -337,6 +384,10 @@ function updateSeedGrowth() {
           if (isInside(x + 1, y - 2) && grid[y - 2][x + 1] === EMPTY) {
             grid[y - 2][x + 1] = LEAVES;
           }
+          // 顶部树叶：最上方木头（y-2）的正上方（y-3）放一块树叶
+          if (isInside(x, y - 3) && grid[y - 3][x] === EMPTY) {
+            grid[y - 3][x] = LEAVES;
+          }
 
           seedTimers[y][x] = 0;
         }
@@ -346,64 +397,72 @@ function updateSeedGrowth() {
 }
 
 function updateFire() {
+  if (!fireOriginGrid) return;
   const now = Date.now();
-  const toUpdate = [];
+  const FIRE_LIFETIME = 2000; // 约 2 秒
+  const directions = [[0, 1], [0, -1], [1, 0], [-1, 0]];
 
+  // 收集本帧所有火方块（避免在迭代中修改 grid 影响判断）
+  const toUpdate = [];
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < cols; x++) {
-      if (grid[y][x] === FIRE) {
-        toUpdate.push({ x, y });
-      }
+      if (grid[y][x] === FIRE) toUpdate.push({ x, y });
     }
   }
 
   for (const { x, y } of toUpdate) {
-    if (grid[y][x] !== FIRE) continue;
+    if (grid[y][x] !== FIRE) continue; // 可能在本轮已被处理掉
+    const origin = fireOriginGrid[y][x];
 
-    if (now - fireTimers[y][x] >= 2000) {
-      grid[y][x] = EMPTY;
+    // 1) 检查相邻是否有水 → 火被扑灭
+    let adjacentWater = false;
+    for (const [dx, dy] of directions) {
+      const nx = x + dx, ny = y + dy;
+      if (isInside(nx, ny) && grid[ny][nx] === WATER) {
+        adjacentWater = true;
+        break;
+      }
+    }
+    if (adjacentWater) {
+      // 火灭：原方块为木头则变木炭，否则变空
+      grid[y][x] = (origin === WOOD) ? CHARCOAL : EMPTY;
       fireTimers[y][x] = 0;
+      fireOriginGrid[y][x] = 0;
+      ensureAuxGrids();
       activateAround(x, y);
       continue;
     }
 
-    const directions = [[0, 1], [0, -1], [1, 0], [-1, 0]];
+    // 2) 计时未到 2 秒：保持燃烧，等待
+    if (now - fireTimers[y][x] < FIRE_LIFETIME) continue;
 
+    // 3) 计时超过 2 秒：检查相邻可燃物
+    let fuelTarget = null;
     for (const [dx, dy] of directions) {
-      const nx = x + dx;
-      const ny = y + dy;
-
+      const nx = x + dx, ny = y + dy;
       if (!isInside(nx, ny)) continue;
-
-      const target = grid[ny][nx];
-
-      if (target === WATER) {
-        grid[y][x] = EMPTY;
-        fireTimers[y][x] = 0;
-        if (isInside(x, y + 1) && grid[y + 1][x] === WOOD) {
-          grid[y + 1][x] = CHARCOAL;
-        }
-        activateAround(x, y);
+      const t = grid[ny][nx];
+      if (t === WOOD || t === LEAVES) {
+        fuelTarget = { x: nx, y: ny, type: t };
         break;
       }
-
-      if (target === WOOD || target === LEAVES) {
-        grid[ny][nx] = FIRE;
-        fireTimers[ny][nx] = Date.now();
-
-        if (target === WOOD) {
-          const checkBelow = isInside(nx, ny + 1) ? grid[ny + 1][nx] : null;
-          if (checkBelow !== WATER && checkBelow !== FIRE) {
-            grid[ny][nx] = CHARCOAL;
-            grid[y][x] = EMPTY;
-            fireTimers[y][x] = 0;
-            activateAround(nx, ny);
-            activateAround(x, y);
-            break;
-          }
-        }
-      }
     }
+
+    if (fuelTarget) {
+      // 点燃一个相邻可燃物（变为 FIRE，记录其原方块类型）
+      grid[fuelTarget.y][fuelTarget.x] = FIRE;
+      fireTimers[fuelTarget.y][fuelTarget.x] = now;
+      fireOriginGrid[fuelTarget.y][fuelTarget.x] = fuelTarget.type;
+      ensureAuxGrids();
+      activateAround(fuelTarget.x, fuelTarget.y);
+    }
+
+    // 自身根据原方块类型决定结果：木头位变木炭，其他变空
+    grid[y][x] = (origin === WOOD) ? CHARCOAL : EMPTY;
+    fireTimers[y][x] = 0;
+    fireOriginGrid[y][x] = 0;
+    ensureAuxGrids();
+    activateAround(x, y);
   }
 }
 
@@ -451,6 +510,14 @@ function gameLoop() {
     updateSeedGrowth();
     updateFire();
     draw();
+    // 房主定时重同步：每 5 秒广播完整世界快照
+    if (isHost && multiplayerEnabled && conn && conn.open) {
+      const now = Date.now();
+      if (now - lastWorldSync >= 5000) {
+        sendNet({ type: 'world', blocks: serializeWorld() });
+        lastWorldSync = now;
+      }
+    }
   }
   requestAnimationFrame(gameLoop);
 }
@@ -592,6 +659,8 @@ function showScreen(state) {
   toggleBtn.classList.toggle('hidden', !inGame);
   // 游戏内显示「创建房间」按钮（已创建/已加入房间则隐藏）
   createRoomBtn.classList.toggle('hidden', !inGame || peer !== null);
+  // 聊天按钮可见性：仅游戏内 + 联机模式
+  updateChatVisibility();
   if (!inGame) {
     closeInventory();
     tooltip.style.display = 'none';
@@ -695,6 +764,7 @@ function setupConn(c) {
   c.on('close', () => {
     multiplayerEnabled = false;
     conn = null;
+    updateChatVisibility();
     if (gameState === 'game' && roomCode) showRoomInfo(roomCode, '对方已断开');
   });
   c.on('error', () => {
@@ -715,6 +785,7 @@ function createRoom() {
 
   peer.on('open', () => {
     multiplayerEnabled = true;
+    updateChatVisibility();
     createRoomBtn.disabled = false;
     createRoomBtn.textContent = '创建房间';
     createRoomBtn.classList.add('hidden');
@@ -727,6 +798,9 @@ function createRoom() {
     setupConn(c);
     c.on('open', () => {
       showRoomInfo(roomCode, '已连接');
+      // 房主向新加入的客户端发送完整世界数据
+      sendNet({ type: 'world', blocks: serializeWorld() });
+      lastWorldSync = Date.now();
     });
   });
 
@@ -766,6 +840,7 @@ function joinRoom(code) {
 
     c.on('open', () => {
       multiplayerEnabled = true;
+      updateChatVisibility();
       joinConfirmBtn.disabled = false;
       joinCancelBtn.disabled = false;
       hideJoinError();
@@ -800,7 +875,9 @@ function cleanupPeer() {
   multiplayerEnabled = false;
   isHost = false;
   roomCode = null;
+  lastWorldSync = 0;
   roomInfo.classList.add('hidden');
+  updateChatVisibility();
   // 重新显示创建房间按钮（若在游戏中）
   if (gameState === 'game') createRoomBtn.classList.remove('hidden');
 }
@@ -817,7 +894,10 @@ function handleRemoteMessage(msg) {
     if (isInside(msg.x, msg.y) && grid[msg.y][msg.x] === EMPTY) {
       grid[msg.y][msg.x] = msg.blockType;
       if (msg.blockType === SEED) seedTimers[msg.y][msg.x] = Date.now();
-      else if (msg.blockType === FIRE) fireTimers[msg.y][msg.x] = Date.now();
+      else if (msg.blockType === FIRE) {
+        fireTimers[msg.y][msg.x] = Date.now();
+        if (fireOriginGrid) fireOriginGrid[msg.y][msg.x] = EMPTY;
+      }
       ensureAuxGrids();
       activateAround(msg.x, msg.y);
     }
@@ -826,11 +906,175 @@ function handleRemoteMessage(msg) {
       grid[msg.y][msg.x] = EMPTY;
       seedTimers[msg.y][msg.x] = 0;
       fireTimers[msg.y][msg.x] = 0;
+      if (fireOriginGrid) fireOriginGrid[msg.y][msg.x] = 0;
       ensureAuxGrids();
       activateAround(msg.x, msg.y);
     }
+  } else if (msg.type === 'world') {
+    // 完整世界同步：用房主数据重建本地世界
+    applyWorldSnapshot(msg.blocks);
+  } else if (msg.type === 'chat') {
+    onChatReceived(msg.from, msg.text);
   }
 }
+
+// ===================== 世界同步 =====================
+// 序列化当前世界为非空方块列表 [[x, y, type], ...]
+function serializeWorld() {
+  const blocks = [];
+  for (let y = 0; y < rows; y++) {
+    const row = grid[y];
+    for (let x = 0; x < cols; x++) {
+      if (row[x] !== EMPTY) blocks.push([x, y, row[x]]);
+    }
+  }
+  return blocks;
+}
+
+// 用房主发来的快照重建本地世界
+function applyWorldSnapshot(blocks) {
+  // 清空本地所有状态
+  for (let y = 0; y < rows; y++) {
+    grid[y].fill(EMPTY);
+    if (seedTimers[y]) seedTimers[y].fill(0);
+    if (fireTimers[y]) fireTimers[y].fill(0);
+    if (fireOriginGrid && fireOriginGrid[y]) fireOriginGrid[y].fill(0);
+  }
+  // 重建方块
+  if (Array.isArray(blocks)) {
+    for (const b of blocks) {
+      const x = b[0], y = b[1], t = b[2];
+      if (!isInside(x, y)) continue;
+      grid[y][x] = t;
+      if (t === FIRE) {
+        fireTimers[y][x] = Date.now();
+        // 远端同步的火不知原方块类型，默认 EMPTY（烧完变空，由下次同步纠正）
+        if (fireOriginGrid) fireOriginGrid[y][x] = EMPTY;
+      }
+    }
+  }
+  // 重置静止标记，让水重新稳定
+  movedGrid = null;
+  stillGrid = null;
+  ensureAuxGrids();
+}
+
+// ===================== 聊天系统 =====================
+function updateChatVisibility() {
+  // 仅在游戏内且联机模式开启时显示聊天按钮
+  const showChat = gameState === 'game' && multiplayerEnabled;
+  chatBtn.classList.toggle('hidden', !showChat);
+  if (!showChat) {
+    // 退出联机时关闭面板并清空红点
+    chatPanel.classList.add('hidden');
+    chatOpen = false;
+    unreadCount = 0;
+    chatDot.classList.add('hidden');
+  }
+}
+
+function openChat() {
+  if (!multiplayerEnabled) return;
+  chatPanel.classList.remove('hidden');
+  chatOpen = true;
+  unreadCount = 0;
+  chatDot.classList.add('hidden');
+  setTimeout(() => chatInput.focus(), 0);
+}
+
+function closeChat() {
+  chatPanel.classList.add('hidden');
+  chatOpen = false;
+  chatInput.blur();
+}
+
+function toggleChat() {
+  if (!multiplayerEnabled) return;
+  if (chatOpen) closeChat();
+  else openChat();
+}
+
+function sendChat() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  if (!multiplayerEnabled || !conn || !conn.open) return;
+  sendNet({ type: 'chat', text, from: nickname });
+  displayChatMessage(nickname, text, true);
+  chatInput.value = '';
+}
+
+function displayChatMessage(from, text, isSelf) {
+  const msg = document.createElement('div');
+  msg.className = 'chat-msg ' + (isSelf ? 'self' : 'other');
+  const nameDiv = document.createElement('div');
+  nameDiv.className = 'chat-name';
+  nameDiv.textContent = isSelf ? '我' : (from || '对方');
+  const textDiv = document.createElement('div');
+  textDiv.className = 'chat-text';
+  textDiv.textContent = text;
+  msg.appendChild(nameDiv);
+  msg.appendChild(textDiv);
+  chatMessages.appendChild(msg);
+  // 自动滚动到最新消息
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function onChatReceived(from, text) {
+  displayChatMessage(from, text, false);
+  if (!chatOpen) {
+    unreadCount++;
+    chatDot.classList.remove('hidden');
+  }
+}
+
+// 聊天按钮：点击切换面板
+chatBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleChat();
+});
+
+// 发送按钮
+chatSendBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  sendChat();
+});
+
+// 输入框：回车发送
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    sendChat();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closeChat();
+  }
+  // 阻止输入框内的按键冒泡到全局（避免触发 T 切换等）
+  e.stopPropagation();
+});
+
+// 阻止输入框点击冒泡关闭面板
+chatPanel.addEventListener('click', (e) => {
+  e.stopPropagation();
+});
+
+// 全局按键：T 切换聊天，Esc 关闭
+window.addEventListener('keydown', (e) => {
+  // 输入框聚焦时不触发全局快捷键（避免输入 T 字符时切换面板）
+  const active = document.activeElement;
+  if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+
+  if (e.key === 't' || e.key === 'T') {
+    if (gameState === 'game' && multiplayerEnabled) {
+      e.preventDefault();
+      toggleChat();
+    }
+  } else if (e.key === 'Escape') {
+    if (chatOpen) {
+      e.preventDefault();
+      closeChat();
+    }
+  }
+});
 
 // ===================== 初始化 =====================
 function init() {
